@@ -16,8 +16,14 @@
 #include "VIsoFile.h"
 
 
-#define BUFFER_SIZE (3*1048576)
+#define BUFFER_SIZE	(3*1048576)
 #define MAX_CLIENTS	5
+
+#define MAX_ENTRIES	4093
+
+#define MIN(a, b)	((a) <= (b) ? (a) : (b))
+
+//#define MERGE_DRIVES 1
 
 enum
 {
@@ -41,8 +47,12 @@ typedef struct
 	uint32_t CD_SECTOR_SIZE;
 } client_t;
 
-static char root_directory[4096];
 static client_t clients[MAX_CLIENTS];
+
+static char root_directory[4096];
+static size_t root_len = 0;
+
+static char *ignore_drives;
 
 static int initialize_socket(uint16_t port)
 {
@@ -163,18 +173,22 @@ static void finalize_client(client_t *client)
 		free(client->dirpath);
 	}
 
-	free(client->buf);
+	if (client->buf)
+	{
+		free(client->buf);
+	}
+
 	memset(client, 0, sizeof(client_t));
 }
 
-static char *translate_path(char *path, int del, int always_del, int *viso)
+static char *translate_path(char *path, int del, int *viso)
 {
 	char *p;
 
 	if (path[0] != '/')
 	{
 		DPRINTF("path must start by '/'. Path received: %s\n", path);
-		if (del && always_del)
+		if (del)
 		{
 			free(path);
 		}
@@ -182,7 +196,7 @@ static char *translate_path(char *path, int del, int always_del, int *viso)
 	}
 
 	p = path;
-	while ((p = strstr(p, "..")))
+	while ((p[0] > ' ') && (p = strstr(p, "..")))
 	{
 		if (strlen(p) >= 2)
 		{
@@ -191,7 +205,7 @@ static char *translate_path(char *path, int del, int always_del, int *viso)
 				if (p[2] == 0 || p[2] == '/' || p[2] == '\\')
 				{
 					DPRINTF("The path \"%s\" is unsecure!\n", path);
-					if (del && always_del)
+					if (del)
 					{
 						free(path);
 					}
@@ -203,7 +217,7 @@ static char *translate_path(char *path, int del, int always_del, int *viso)
 		p += 2;
 	}
 
-	p = (char *)malloc(strlen(root_directory)+strlen(path)+1);
+	p = (char *)malloc(root_len + strlen(path)+1);
 	if (!p)
 	{
 		printf("Memory allocation error\n");
@@ -212,31 +226,65 @@ static char *translate_path(char *path, int del, int always_del, int *viso)
 
 	sprintf(p, "%s%s", root_directory, path);
 
-	if (del)
-	{
-		free(path);
-	}
-
 	if (viso)
 	{
-		char *q = p + strlen(root_directory);
+		char *q = p + root_len;
 
 		if (strstr(q, "/***PS3***/") == q)
 		{
 			memmove(q, q+10, strlen(q+10)+1);
+			memmove(path, path+10, strlen(path+10)+1);
 			DPRINTF("p -> %s\n", p);
 			*viso = VISO_PS3;
 		}
 		else if (strstr(q, "/***DVD***/") == q)
 		{
 			memmove(q, q+10, strlen(q+10)+1);
+			memmove(path, path+10, strlen(path+10)+1);
 			DPRINTF("p -> %s\n", p);
 			*viso = VISO_ISO;
 		}
 		else
 		{
-			*viso = 0;
+			*viso = VISO_NONE;
 		}
+	}
+
+#ifdef WIN32
+	#ifdef MERGE_DRIVES
+	int pos = strlen(p) - 1; if(pos > 0 && p[pos] == '/') p[pos] = 0;
+
+	file_stat_t st;
+	if (stat_file(p, &st) < 0)
+	{
+		for(int drive = 'C'; drive <= 'Z'; drive++)
+		{
+			if(ignore_drives)
+			{
+				bool ignore; ignore = false;
+
+				for(int d = 0; d < strlen(ignore_drives); d++)
+					if((ignore_drives[d] & 0xFF) == drive) {ignore = true; break;}
+
+				if(ignore) continue;
+			}
+
+			sprintf(p, "%c:%s", drive, path);
+			int pos = strlen(p) - 1; if(pos > 0 && p[pos] == '/') p[pos] = 0;
+			if (stat_file(p, &st) >= 0) break;
+		}
+	}
+	#endif
+#endif
+
+	if(!strstr(p, ".PNG"))
+	{
+		printf("%s\n", p);
+	}
+
+	if (del)
+	{
+		free(path);
 	}
 
 	return p;
@@ -322,28 +370,28 @@ static int process_open_cmd(client_t *client, netiso_open_cmd *cmd)
 		return -1;
 	}
 
+	if (client->ro_file)
+	{
+		delete client->ro_file;
+	}
+
 	filepath[fp_len] = 0;
 	ret = recv_all(client->s, (void *)filepath, fp_len);
-	if (ret != fp_len)
+	if (ret != fp_len || !strcmp(filepath, "/CLOSEFILE"))
 	{
 		DPRINTF("recv failed, getting filename for open: %d %d\n", ret, get_network_error());
 		free(filepath);
 		return -1;
 	}
 
-	filepath = translate_path(filepath, 1, 1, &viso);
+	filepath = translate_path(filepath, 1, &viso);
 	if (!filepath)
 	{
-		DPRINTF("Path cannot be translated. Connection with this client will be aboreted.\n");
+		DPRINTF("Path cannot be translated. Connection with this client will be aborted.\n");
 		return -1;
 	}
 
 	DPRINTF("open %s\n", filepath);
-
-	if (client->ro_file)
-	{
-		delete client->ro_file;
-	}
 
 	if (viso == VISO_NONE)
 	{
@@ -352,11 +400,13 @@ static int process_open_cmd(client_t *client, netiso_open_cmd *cmd)
 	else
 	{
 		client->ro_file = new VIsoFile((viso == VISO_PS3));
+        printf("building virtual iso...\n");
 	}
 
 	if (client->ro_file->open(filepath, O_RDONLY) < 0)
 	{
 		DPRINTF("open error on \"%s\" (viso=%d)\n", filepath, viso);
+		printf("open error on \"%s\" (viso=%d)\n", filepath + root_len, viso);
 		error = 1;
 		delete client->ro_file;
 		client->ro_file = NULL;
@@ -374,11 +424,14 @@ static int process_open_cmd(client_t *client, netiso_open_cmd *cmd)
 			result.mtime = BE64(st.mtime);
 
 			// detect sector size
-			char buffer[0x10]; buffer[0xD] = 0;
-			client->ro_file->seek(0x9320, SEEK_SET); client->ro_file->read(buffer, 0xC); if(memcmp(buffer, "PLAYSTATION ", 0xC)==0) client->CD_SECTOR_SIZE = 2352; else {
-			client->ro_file->seek(0x8020, SEEK_SET); client->ro_file->read(buffer, 0xC); if(memcmp(buffer, "PLAYSTATION ", 0xC)==0) client->CD_SECTOR_SIZE = 2048; else {
-			client->ro_file->seek(0x9920, SEEK_SET); client->ro_file->read(buffer, 0xC); if(memcmp(buffer, "PLAYSTATION ", 0xC)==0) client->CD_SECTOR_SIZE = 2448; else {
-			client->ro_file->seek(0x9220, SEEK_SET); client->ro_file->read(buffer, 0xC); if(memcmp(buffer, "PLAYSTATION ", 0xC)==0) client->CD_SECTOR_SIZE = 2336; }}}
+			if (result.file_size > 0x10000ULL)
+			{
+				char buffer[0x10]; buffer[0xD] = 0;
+				client->ro_file->seek(0x9320, SEEK_SET); client->ro_file->read(buffer, 0xC); if(memcmp(buffer, "PLAYSTATION ", 0xC)==0) {client->CD_SECTOR_SIZE = 2352; printf("cd sector size: %i\n", client->CD_SECTOR_SIZE);} else {
+				client->ro_file->seek(0x8020, SEEK_SET); client->ro_file->read(buffer, 0xC); if(memcmp(buffer, "PLAYSTATION ", 0xC)==0) {client->CD_SECTOR_SIZE = 2048; printf("cd sector size: %i\n", client->CD_SECTOR_SIZE);} else {
+				client->ro_file->seek(0x9220, SEEK_SET); client->ro_file->read(buffer, 0xC); if(memcmp(buffer, "PLAYSTATION ", 0xC)==0) {client->CD_SECTOR_SIZE = 2336; printf("cd sector size: %i\n", client->CD_SECTOR_SIZE);} else {
+				client->ro_file->seek(0x9920, SEEK_SET); client->ro_file->read(buffer, 0xC); if(memcmp(buffer, "PLAYSTATION ", 0xC)==0) {client->CD_SECTOR_SIZE = 2448; printf("cd sector size: %i\n", client->CD_SECTOR_SIZE);} }}}
+			}
 		}
 	}
 
@@ -428,17 +481,14 @@ static int process_read_file_critical(client_t *client, netiso_read_file_critica
 		return -1;
 	}
 
+	uint32_t read_size = MIN(BUFFER_SIZE, remaining);
+
 	while (remaining > 0)
 	{
-		uint32_t read_size;
 
-		if (remaining < BUFFER_SIZE)
+		if (remaining < read_size)
 		{
 			read_size = remaining;
-		}
-		else
-		{
-			read_size = BUFFER_SIZE;
 		}
 
 		if (client->ro_file->read(client->buf, read_size) != read_size)
@@ -483,7 +533,7 @@ static int process_read_cd_2048_critical_cmd(client_t *client, netiso_read_cd_20
 	buf = client->buf;
 	for (uint32_t i = 0; i < sector_count; i++)
 	{
-		client->ro_file->seek(offset+24, SEEK_SET);
+    	client->ro_file->seek(offset+24, SEEK_SET);
 		if (client->ro_file->read(buf, 2048) != 2048)
 		{
 			DPRINTF("read_file failed on read cd 2048 critical command!\n");
@@ -581,7 +631,7 @@ static int process_create_cmd(client_t *client, netiso_create_cmd *cmd)
 		return -1;
 	}
 
-	filepath = translate_path(filepath, 1, 1, NULL);
+	filepath = translate_path(filepath, 1, NULL);
 	if (!filepath)
 	{
 		DPRINTF("Path cannot be translated. Connection with this client will be aborted.\n");
@@ -671,6 +721,151 @@ send_result_write_file:
 	return 0;
 }
 
+static int process_delete_file_cmd(client_t *client, netiso_delete_file_cmd *cmd)
+{
+	netiso_delete_file_result result;
+	char *filepath;
+	uint16_t fp_len;
+	int ret;
+
+	fp_len = BE16(cmd->fp_len);
+	filepath = (char *)malloc(fp_len+1);
+	if (!filepath)
+	{
+		DPRINTF("CRITICAL: memory allocation error\n");
+		return -1;
+	}
+
+	filepath[fp_len] = 0;
+	ret = recv_all(client->s, (void *)filepath, fp_len);
+	if (ret != fp_len)
+	{
+		DPRINTF("recv failed, getting filename for delete file: %d %d\n", ret, get_network_error());
+		free(filepath);
+		return -1;
+	}
+
+	filepath = translate_path(filepath, 1, NULL);
+	if (!filepath)
+	{
+		DPRINTF("Path cannot be translated. Connection with this client will be aborted.\n");
+		return -1;
+	}
+
+	DPRINTF("delete %s\n", filepath);
+	printf("delete %s\n", filepath + root_len);
+
+	result.delete_result = BE32(unlink(filepath));
+	free(filepath);
+
+	ret = send(client->s, (char *)&result, sizeof(result), 0);
+	if (ret != sizeof(result))
+	{
+		DPRINTF("delete, send result error: %d %d\n", ret, get_network_error());
+		return -1;
+	}
+
+	return 0;
+}
+
+static int process_mkdir_cmd(client_t *client, netiso_mkdir_cmd *cmd)
+{
+	netiso_mkdir_result result;
+	char *dirpath;
+	uint16_t dp_len;
+	int ret;
+
+	dp_len = BE16(cmd->dp_len);
+	dirpath = (char *)malloc(dp_len+1);
+	if (!dirpath)
+	{
+		DPRINTF("CRITICAL: memory allocation error\n");
+		return -1;
+	}
+
+	dirpath[dp_len] = 0;
+	ret = recv_all(client->s, (void *)dirpath, dp_len);
+	if (ret != dp_len)
+	{
+		DPRINTF("recv failed, getting dirname for mkdir: %d %d\n", ret, get_network_error());
+		free(dirpath);
+		return -1;
+	}
+
+	dirpath = translate_path(dirpath, 1, NULL);
+	if (!dirpath)
+	{
+		DPRINTF("Path cannot be translated. Connection with this client will be aborted.\n");
+		return -1;
+	}
+
+	DPRINTF("mkdir %s\n", dirpath);
+    printf("mkdir %s\n", dirpath + root_len);
+
+#ifdef WIN32
+	result.mkdir_result = BE32(mkdir(dirpath));
+#else
+	result.mkdir_result = BE32(mkdir(dirpath, 0777));
+#endif
+	free(dirpath);
+
+	ret = send(client->s, (char *)&result, sizeof(result), 0);
+	if (ret != sizeof(result))
+	{
+		DPRINTF("open dir, send result error: %d %d\n", ret, get_network_error());
+		return -1;
+	}
+
+	return 0;
+}
+
+static int process_rmdir_cmd(client_t *client, netiso_rmdir_cmd *cmd)
+{
+	netiso_rmdir_result result;
+	char *dirpath;
+	uint16_t dp_len;
+	int ret;
+
+	dp_len = BE16(cmd->dp_len);
+	dirpath = (char *)malloc(dp_len+1);
+	if (!dirpath)
+	{
+		DPRINTF("CRITICAL: memory allocation error\n");
+		return -1;
+	}
+
+	dirpath[dp_len] = 0;
+	ret = recv_all(client->s, (void *)dirpath, dp_len);
+	if (ret != dp_len)
+	{
+		DPRINTF("recv failed, getting dirname for rmdir: %d %d\n", ret, get_network_error());
+		free(dirpath);
+		return -1;
+	}
+
+	dirpath = translate_path(dirpath, 1, NULL);
+	if (!dirpath)
+	{
+		DPRINTF("Path cannot be translated. Connection with this client will be aborted.\n");
+		return -1;
+	}
+
+	DPRINTF("rmdir %s\n", dirpath);
+    printf("rmdir %s\n", dirpath + root_len);
+
+	result.rmdir_result = BE32(rmdir(dirpath));
+	free(dirpath);
+
+	ret = send(client->s, (char *)&result, sizeof(result), 0);
+	if (ret != sizeof(result))
+	{
+		DPRINTF("open dir, send result error: %d %d\n", ret, get_network_error());
+		return -1;
+	}
+
+	return 0;
+}
+
 static int process_open_dir_cmd(client_t *client, netiso_open_dir_cmd *cmd)
 {
 	netiso_open_dir_result result;
@@ -696,7 +891,7 @@ static int process_open_dir_cmd(client_t *client, netiso_open_dir_cmd *cmd)
 		return -1;
 	}
 
-	dirpath = translate_path(dirpath, 1, 1, NULL);
+	dirpath = translate_path(dirpath, 1, NULL);
 	if (!dirpath)
 	{
 		DPRINTF("Path cannot be translated. Connection with this client will be aborted.\n");
@@ -895,154 +1090,12 @@ send_result_read_dir:
 	return 0;
 }
 
-static int process_delete_file_cmd(client_t *client, netiso_delete_file_cmd *cmd)
-{
-	netiso_delete_file_result result;
-	char *filepath;
-	uint16_t fp_len;
-	int ret;
-
-	fp_len = BE16(cmd->fp_len);
-	filepath = (char *)malloc(fp_len+1);
-	if (!filepath)
-	{
-		DPRINTF("CRITICAL: memory allocation error\n");
-		return -1;
-	}
-
-	filepath[fp_len] = 0;
-	ret = recv_all(client->s, (void *)filepath, fp_len);
-	if (ret != fp_len)
-	{
-		DPRINTF("recv failed, getting filename for delete file: %d %d\n", ret, get_network_error());
-		free(filepath);
-		return -1;
-	}
-
-	filepath = translate_path(filepath, 1, 1, NULL);
-	if (!filepath)
-	{
-		DPRINTF("Path cannot be translated. Connection with this client will be aborted.\n");
-		return -1;
-	}
-
-	DPRINTF("delete %s\n", filepath);
-
-	result.delete_result = BE32(unlink(filepath));
-	free(filepath);
-
-	ret = send(client->s, (char *)&result, sizeof(result), 0);
-	if (ret != sizeof(result))
-	{
-		DPRINTF("delete, send result error: %d %d\n", ret, get_network_error());
-		return -1;
-	}
-
-	return 0;
-}
-
-static int process_mkdir_cmd(client_t *client, netiso_mkdir_cmd *cmd)
-{
-	netiso_mkdir_result result;
-	char *dirpath;
-	uint16_t dp_len;
-	int ret;
-
-	dp_len = BE16(cmd->dp_len);
-	dirpath = (char *)malloc(dp_len+1);
-	if (!dirpath)
-	{
-		DPRINTF("CRITICAL: memory allocation error\n");
-		return -1;
-	}
-
-	dirpath[dp_len] = 0;
-	ret = recv_all(client->s, (void *)dirpath, dp_len);
-	if (ret != dp_len)
-	{
-		DPRINTF("recv failed, getting dirname for mkdir: %d %d\n", ret, get_network_error());
-		free(dirpath);
-		return -1;
-	}
-
-	dirpath = translate_path(dirpath, 1, 1, NULL);
-	if (!dirpath)
-	{
-		DPRINTF("Path cannot be translated. Connection with this client will be aborted.\n");
-		return -1;
-	}
-
-	DPRINTF("mkdir %s\n", dirpath);
-
-#ifdef WIN32
-	result.mkdir_result = BE32(mkdir(dirpath));
-#else
-	result.mkdir_result = BE32(mkdir(dirpath, 0777));
-#endif
-	free(dirpath);
-
-	ret = send(client->s, (char *)&result, sizeof(result), 0);
-	if (ret != sizeof(result))
-	{
-		DPRINTF("open dir, send result error: %d %d\n", ret, get_network_error());
-		return -1;
-	}
-
-	return 0;
-}
-
-static int process_rmdir_cmd(client_t *client, netiso_rmdir_cmd *cmd)
-{
-	netiso_rmdir_result result;
-	char *dirpath;
-	uint16_t dp_len;
-	int ret;
-
-	dp_len = BE16(cmd->dp_len);
-	dirpath = (char *)malloc(dp_len+1);
-	if (!dirpath)
-	{
-		DPRINTF("CRITICAL: memory allocation error\n");
-		return -1;
-	}
-
-	dirpath[dp_len] = 0;
-	ret = recv_all(client->s, (void *)dirpath, dp_len);
-	if (ret != dp_len)
-	{
-		DPRINTF("recv failed, getting dirname for rmdir: %d %d\n", ret, get_network_error());
-		free(dirpath);
-		return -1;
-	}
-
-	dirpath = translate_path(dirpath, 1, 1, NULL);
-	if (!dirpath)
-	{
-		DPRINTF("Path cannot be translated. Connection with this client will be aborted.\n");
-		return -1;
-	}
-
-	DPRINTF("rmdir %s\n", dirpath);
-
-	result.rmdir_result = BE32(rmdir(dirpath));
-	free(dirpath);
-
-	ret = send(client->s, (char *)&result, sizeof(result), 0);
-	if (ret != sizeof(result))
-	{
-		DPRINTF("open dir, send result error: %d %d\n", ret, get_network_error());
-		return -1;
-	}
-
-	return 0;
-}
-
 static int process_read_dir_cmd(client_t *client, netiso_read_dir_entry_cmd *cmd)
 {
 	(void) cmd;
 	netiso_read_dir_result result;
 	netiso_read_dir_result_data *dir_entries = (netiso_read_dir_result_data *) malloc(sizeof(netiso_read_dir_result_data)*4096);
-	int64_t dir_size=0;
+	int64_t dir_size; dir_size=0;
 
 	file_stat_t st;
 	struct dirent *entry;
@@ -1097,9 +1150,88 @@ static int process_read_dir_cmd(client_t *client, netiso_read_dir_entry_cmd *cmd
 
 			free(path);
 			dir_size++;
-			if(dir_size>4093) break;
+			if(dir_size > MAX_ENTRIES) break;
 		}
 	}
+
+#ifdef WIN32
+	#ifdef MERGE_DRIVES
+	if(root_len > 2 && dirpath_len > (root_len + 1) && strncmp(client->dirpath, root_directory, root_len) == 0)
+	{
+		memmove(client->dirpath + 2, client->dirpath + root_len, strlen(client->dirpath + root_len) + 1);
+
+		client->dirpath[1] = ':';
+
+		dirpath_len = strlen(client->dirpath);
+
+		if(client->dir) {closedir(client->dir); client->dir = NULL;}
+
+		for(int drive = 'C'; drive <= 'Z'; drive++)
+		{
+			if(dir_size > MAX_ENTRIES) break;
+
+			if(ignore_drives)
+			{
+				bool ignore; ignore = false;
+
+				for(int d = 0; d < strlen(ignore_drives); d++)
+					if((ignore_drives[d]  & 0xFF) == drive) {ignore = true; break;}
+
+				if(ignore) continue;
+			}
+
+			client->dirpath[0] = drive;
+
+			if (stat_file(client->dirpath, &st) < 0) continue;
+			client->dir = opendir(client->dirpath);
+
+			while ((entry = readdir(client->dir)))
+			{
+				if(entry->d_name[0] == '.' && (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)) continue;
+
+				d_name_len = strlen(entry->d_name);
+				if (d_name_len == 0) continue;
+
+				if (d_name_len <= 510)
+				{
+					char *path = (char*)malloc(dirpath_len + d_name_len + 2);
+
+					sprintf(path, "%s/%s", client->dirpath, entry->d_name);
+					st.file_size=0;
+					st.mode=S_IFDIR;
+					st.mtime=0;
+					st.atime=0;
+					st.ctime=0;
+					stat_file(path, &st);
+
+					if(!st.mtime) st.mtime=st.ctime;
+					if(!st.mtime) st.mtime=st.atime;
+
+					if ((st.mode & S_IFDIR) == S_IFDIR)
+					{
+							dir_entries[dir_size].file_size = (0);
+							dir_entries[dir_size].is_directory = 1;
+					}
+					else
+					{
+							dir_entries[dir_size].file_size =  BE64(st.file_size);
+							dir_entries[dir_size].is_directory = 0;
+					}
+
+					snprintf(dir_entries[dir_size].name, 510, "%s", entry->d_name);
+					dir_entries[dir_size].mtime = BE64(st.mtime);
+
+					free(path);
+					dir_size++;
+					if(dir_size > MAX_ENTRIES) break;
+				}
+			}
+		}
+	}
+	#endif
+#endif
+
+	if(client->dir) {closedir(client->dir); client->dir = NULL;}
 
 send_result_read_dir_cmd:
 
@@ -1149,7 +1281,7 @@ static int process_stat_cmd(client_t *client, netiso_stat_cmd *cmd)
 		return -1;
 	}
 
-	filepath = translate_path(filepath, 1, 1, NULL);
+	filepath = translate_path(filepath, 1, NULL);
 	if (!filepath)
 	{
 		DPRINTF("Path cannot be translated. Connection with this client will be aborted.\n");
@@ -1217,7 +1349,7 @@ static int process_get_dir_size_cmd(client_t *client, netiso_get_dir_size_cmd *c
 		return -1;
 	}
 
-	dirpath = translate_path(dirpath, 1, 1, NULL);
+	dirpath = translate_path(dirpath, 1, NULL);
 	if (!dirpath)
 	{
 		DPRINTF("Path cannot be translated. Connection with this client will be aborted.\n");
@@ -1338,6 +1470,8 @@ int main(int argc, char *argv[])
 	uint32_t whitelist_end = 0;
 	uint16_t port = NETISO_PORT;
 
+	printf("ps3netsrv build 20151215.1 (mod by aldostools)\n\n");
+
 #ifndef WIN32
 	if (sizeof(off_t) < 8)
 	{
@@ -1368,7 +1502,9 @@ int main(int argc, char *argv[])
 			break;
 	}
 
-	if (strlen(root_directory) == 0)
+    root_len = strlen(root_directory);
+
+	if (root_len == 0)
 	{
 		printf("/ can't be specified as root directory!\n");
 		return -1;
@@ -1465,6 +1601,22 @@ int main(int argc, char *argv[])
 		DPRINTF("Whitelist: %08X-%08X\n", whitelist_start, whitelist_end);
 	}
 
+	if (argc > 4)
+	{
+		ignore_drives = argv[4];
+	}
+	else if(whitelist_end == 0x0A000008)
+	{
+		ignore_drives = (char*)"E"; // ignore E:\ by default only if whitelist is 10.0.0.8
+	}
+
+	// convert to upper case
+	if(ignore_drives)
+	{
+		for(int d = 0; d < strlen(ignore_drives); d++)
+			if((ignore_drives[d] >= 'a') && (ignore_drives[d] <= 'z')) ignore_drives[d] -= 0x20;
+	}
+
 	s = initialize_socket(port);
 	if (s < 0)
 	{
@@ -1549,10 +1701,14 @@ int main(int argc, char *argv[])
 		create_start_thread(&clients[i].thread, client_thread, &clients[i]);
 	}
 
+	if (ignore_drives)
+	{
+		free(ignore_drives);
+	}
+
 #ifdef WIN32
 	WSACleanup();
 #endif
 
 	return 0;
 }
-
