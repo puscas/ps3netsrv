@@ -4,6 +4,7 @@ BUILD_TYPE = release
 OUTPUT := ps3netsrv
 OBJS=main.o compat.o File.o VIsoFile.o
 CFLAGS=-Wall -I. -std=gnu99 -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64
+CXXFLAGS=-D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64
 LDFLAGS=-L. 
 LIBS = -lstdc++
 
